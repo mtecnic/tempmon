@@ -1,0 +1,4 @@
+gddr6
+build/
+*.o
+*.a

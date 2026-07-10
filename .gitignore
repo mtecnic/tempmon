@@ -1,0 +1,10 @@
+# tempmon runtime output — crash logs are per-machine, not source
+logs/
+__pycache__/
+*.pyc
+
+# gddr6 vendored tool: source is committed, build artifacts + test scratch are not
+gddr6/build/
+gddr6/vram_test.txt
+*.o
+*.a

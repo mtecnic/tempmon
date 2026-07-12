@@ -14,6 +14,7 @@ It also reports **GDDR6X VRAM junction temperature** per card (the metric that a
 ./tempmon.py                 # or: python3 tempmon.py
 ./tempmon.py -i 1            # refresh interval seconds (default 2)
 ./tempmon.py -d /path/logs   # log directory (default ./logs)
+./tempmon.py --keep 20       # keep only N most recent sessions (default 0 = keep all)
 ./tempmon.py --no-vram       # skip GDDR6X VRAM temps (no sudo gddr6)
 ./tempmon.py --gddr6-bin P   # path to gddr6 binary (default gddr6/build/bin/gddr6)
 ```

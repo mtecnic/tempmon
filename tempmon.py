@@ -14,7 +14,9 @@ Keys:  q / Ctrl-C = quit    p = reset peaks
 
 import argparse
 import curses
+import glob
 import json
+import locale
 import os
 import re
 import subprocess
@@ -33,6 +35,7 @@ VRAM_TEMP = (85, 95, 105)  # GDDR6X junction: throttles ~105C, hard limit ~110C
 
 # colour pair ids
 C_OK, C_WARN, C_HOT, C_CRIT, C_HEAD, C_DIM, C_LABEL = 1, 2, 3, 4, 5, 6, 7
+C_ACCENT, C_TRACK = 8, 9
 
 
 def color_for(val, thr):
@@ -50,7 +53,8 @@ def color_for(val, thr):
 # Sampling
 # ---------------------------------------------------------------------------
 GPU_QUERY = ("index,name,temperature.gpu,fan.speed,utilization.gpu,"
-             "memory.used,memory.total,power.draw,power.limit,pci.bus_id")
+             "memory.used,memory.total,power.draw,power.limit,pci.bus_id,"
+             "clocks.gr,clocks.mem,clocks.max.gr,clocks.max.mem")
 
 
 def read_gpus():
@@ -65,7 +69,7 @@ def read_gpus():
     gpus = []
     for line in out.strip().splitlines():
         f = [x.strip() for x in line.split(",")]
-        if len(f) < 10:
+        if len(f) < 14:
             continue
         def num(x):
             try:
@@ -78,6 +82,8 @@ def read_gpus():
             "mem_used": num(f[5]), "mem_total": num(f[6]),
             "power": num(f[7]), "power_lim": num(f[8]),
             "bus": pci_bus(f[9]), "vram": None,
+            "sclk": num(f[10]), "mclk": num(f[11]),
+            "sclk_max": num(f[12]), "mclk_max": num(f[13]),
         })
     return gpus
 
@@ -267,36 +273,57 @@ class VramReader:
     def close(self):
         if not self.proc:
             return
-        # Closing the pipe makes gddr6's next write SIGPIPE (it doesn't catch
-        # it) so the root process exits; SIGTERM alone won't stop it.
+        # gddr6 runs as root under `sudo -n`, so we can't signal it directly and
+        # it ignores SIGTERM. The real kill switch is closing the read end of its
+        # pipe: gddr6 takes SIGPIPE on its next write (~1s; it installs no
+        # SIGPIPE handler) and exits, which lets the sudo wrapper exit too. We
+        # then wait so we don't return while a half-dead gddr6 could still be
+        # holding the GPU BAR -- a lingering instance corrupts the next run's
+        # readings (0C / garbage from BAR contention).
         try:
             self.proc.stdout.close()
         except OSError:
             pass
         try:
-            self.proc.terminate()
+            self.proc.terminate()  # nudge the sudo wrapper; harmless to gddr6
         except OSError:
             pass
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            # SIGPIPE didn't take within 2s. SIGKILL only reaps the sudo wrapper
+            # (it can't reach the root child, and would orphan it) -- but the
+            # pipe is already closed, so gddr6 still dies on its next write. This
+            # just ensures we don't leave the wrapper hanging at exit.
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 class Logger:
-    def __init__(self, logdir, start_str, vram=False):
+    def __init__(self, logdir, start_str, vram=False, keep=0):
         os.makedirs(logdir, exist_ok=True)
+        self.logdir = logdir
         self.csv_path = os.path.join(logdir, f"tempmon_{start_str}.csv")
         self.peak_path = os.path.join(logdir, f"tempmon_{start_str}_peak.txt")
         self.csv = open(self.csv_path, "w", buffering=1)
         self.header = None
         self.vram = vram
+        # Rotate old sessions now that this run's files exist and are newest.
+        self.pruned = prune_logs(logdir, keep) if keep and keep > 0 else 0
 
     def _columns(self, gpus, sensors):
         cols = ["timestamp"]
         for g in gpus:
             i = g["idx"]
             cols += [f"gpu{i}_temp", f"gpu{i}_fan", f"gpu{i}_util",
-                     f"gpu{i}_mem_used_mb", f"gpu{i}_power_w"]
+                     f"gpu{i}_mem_used_mb", f"gpu{i}_power_w",
+                     f"gpu{i}_core_clock_mhz", f"gpu{i}_mem_clock_mhz"]
             if self.vram:
                 cols.append(f"gpu{i}_vram_temp")
         for name, _ in sensors:
@@ -311,7 +338,8 @@ class Logger:
         row = [ts_str]
         for g in gpus:
             row += [fmt(g["temp"]), fmt(g["fan"]), fmt(g["util"]),
-                    fmt(g["mem_used"]), fmt(g["power"])]
+                    fmt(g["mem_used"]), fmt(g["power"]),
+                    fmt(g["sclk"]), fmt(g["mclk"])]
             if self.vram:
                 row.append(fmt(g.get("vram")))
         for _, v in sensors:
@@ -342,6 +370,32 @@ class Logger:
             pass
 
 
+def prune_logs(logdir, keep):
+    """Keep only the `keep` most recent sessions in `logdir`, deleting older
+    ones' .csv + _peak.txt files. A session is one tempmon_<start>.csv; the
+    start timestamp sorts chronologically, so the newest `keep` names win
+    (the just-created current session is newest, so it is always retained).
+
+    Never raises: a file we can't unlink (e.g. an old root-owned log) is
+    skipped, matching tempmon's degrade-don't-crash contract. Returns the
+    number of files removed.
+    """
+    try:
+        sessions = sorted(glob.glob(os.path.join(logdir, "tempmon_*.csv")))
+    except OSError:
+        return 0
+    removed = 0
+    for csv_path in sessions[:-keep]:  # everything but the newest `keep`
+        peak_path = csv_path[:-len(".csv")] + "_peak.txt"
+        for path in (csv_path, peak_path):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass  # missing peak file, or no permission (root-owned) -- skip
+    return removed
+
+
 def fmt(v):
     return "" if v is None else f"{v:.1f}"
 
@@ -370,6 +424,22 @@ def update_peaks(peaks, gpus, sensors, power_info=None):
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+# GPU table column layout: (x offset, width). Values are right-aligned into
+# each cell; the temp bar is drawn separately in the gap after `core`.
+GPU_COLS = {
+    "idx":  (1, 3),
+    "core": (4, 4),
+    "bar":  (9, 12),
+    "vram": (22, 5),
+    "fan":  (28, 5),
+    "util": (34, 5),
+    "sclk": (40, 6),
+    "mclk": (47, 6),
+    "mem":  (54, 12),
+    "pwr":  (67, 11),
+}
+
+
 def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
          vram_status="", power_info=None):
     h, w = stdscr.getmaxyx()
@@ -377,90 +447,126 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
 
     def put(y, x, text, attr=0):
         if 0 <= y < h and 0 <= x < w:
-            stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+            try:
+                stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+            except curses.error:
+                pass  # wide glyph at the last cell etc. -- never crash on draw
+
+    def cell(y, key, text, attr=0):
+        x, cw = GPU_COLS[key]
+        put(y, x, text[:cw].rjust(cw), attr)
+
+    def rule(y):
+        put(y, 0, "─" * max(0, w - 1), curses.color_pair(C_DIM))
+
+    def section(y, label, note="", note_col=C_DIM):
+        put(y, 0, "▌", curses.color_pair(C_ACCENT) | bold)
+        put(y, 2, label, curses.color_pair(C_ACCENT) | bold)
+        if note:
+            put(y, 4 + len(label), note, curses.color_pair(note_col))
 
     bold = curses.A_BOLD
     row = 0
-    title = " tempmon "
-    put(row, 0, title, curses.color_pair(C_HEAD) | bold)
-    put(row, len(title) + 1,
-        f"refresh {interval:g}s   up {uptime}   {time.strftime('%H:%M:%S')}   "
-        f"[q]uit [p]eak-reset", curses.color_pair(C_DIM))
-    row += 2
+
+    # ---- title bar ----
+    put(row, 0, " tempmon ", curses.color_pair(C_HEAD) | bold)
+    put(row, 10,
+        f"refresh {interval:g}s  ·  up {uptime}  ·  {time.strftime('%H:%M:%S')}",
+        curses.color_pair(C_DIM))
+    put(row, w - 22, "[q]uit  [p]eak-reset", curses.color_pair(C_DIM))
+    row += 1
+    rule(row); row += 1
 
     # ---- GPUs ----
-    put(row, 0, "GPUs", curses.color_pair(C_LABEL) | bold)
-    if vram_status:
-        put(row, 6, vram_status, curses.color_pair(C_DIM))
+    section(row, "GPUs", vram_status,
+            C_OK if "unavailable" not in vram_status else C_WARN)
     row += 1
     if not gpus:
         put(row, 2, "nvidia-smi unavailable", curses.color_pair(C_CRIT)); row += 1
     else:
-        hdr = (f"{'#':<2} {'core':>5} {'vram':>5} {'fan':>5} {'util':>5} "
-               f"{'memory':>15} {'power':>13}  bar")
-        put(row, 2, hdr, curses.color_pair(C_DIM)); row += 1
+        hcol = curses.color_pair(C_DIM)
+        for key, label in (("idx", "#"), ("core", "core"), ("vram", "vram"),
+                           ("fan", "fan"), ("util", "util"), ("sclk", "sclk"),
+                           ("mclk", "mclk"), ("mem", "memory"), ("pwr", "power")):
+            cell(row, key, label, hcol)
+        put(row, GPU_COLS["bar"][0], "temp", hcol)
+        row += 1
         for g in gpus:
-            x = 2
-            put(row, x, f"{g['idx']:<2} "); x += 3
-            tcol = curses.color_pair(color_for(g["temp"], GPU_TEMP)) | bold if g["temp"] is not None else 0
-            put(row, x, f"{ival(g['temp'])+'C':>5}", tcol); x += 6
+            cell(row, "idx", g["idx"], curses.color_pair(C_LABEL) | bold)
+            tcol = (curses.color_pair(color_for(g["temp"], GPU_TEMP)) | bold
+                    if g["temp"] is not None else curses.color_pair(C_DIM))
+            cell(row, "core", ival(g["temp"]) + "°", tcol)
+            draw_tempbar(put, row, GPU_COLS["bar"][0], g["temp"], GPU_TEMP,
+                         GPU_COLS["bar"][1])
             vram = g.get("vram")
             vcol = (curses.color_pair(color_for(vram, VRAM_TEMP)) | bold
                     if vram is not None else curses.color_pair(C_DIM))
-            put(row, x, f"{ival(vram)+'C':>5}", vcol); x += 6
-            put(row, x, f"{ival(g['fan'])+'%':>5}",
-                curses.color_pair(fan_color(g["fan"]))); x += 6
-            put(row, x, f"{ival(g['util'])+'%':>5}"); x += 6
+            cell(row, "vram", ival(vram) + "°", vcol)
+            cell(row, "fan", ival(g["fan"]) + "%",
+                 curses.color_pair(fan_color(g["fan"])))
+            cell(row, "util", ival(g["util"]) + "%",
+                 curses.color_pair(C_OK if (g["util"] or 0) >= 5 else C_DIM))
+            cell(row, "sclk", ival(g["sclk"]),
+                 curses.color_pair(clock_color(g["sclk"], g["sclk_max"])))
+            cell(row, "mclk", ival(g["mclk"]),
+                 curses.color_pair(clock_color(g["mclk"], g["mclk_max"])))
             mem = "-"
             if g["mem_used"] is not None and g["mem_total"] is not None:
                 mem = f"{g['mem_used']/1024:.1f}/{g['mem_total']/1024:.0f}G"
-            put(row, x, f"{mem:>15}"); x += 16
+            cell(row, "mem", mem)
             pw = "-"
             if g["power"] is not None and g["power_lim"] is not None:
                 pw = f"{g['power']:.0f}/{g['power_lim']:.0f}W"
-            put(row, x, f"{pw:>13}"); x += 15
-            # temp bar (30..90C mapped)
-            put(row, x, tempbar(g["temp"], GPU_TEMP))
+            pcol = C_OK
+            if g["power"] is not None and g["power_lim"]:
+                pcol = fan_color(100 * g["power"] / g["power_lim"])
+            cell(row, "pwr", pw, curses.color_pair(pcol))
             row += 1
     row += 1
 
     # ---- Power ----
     pi = power_info or {}
     if pi.get("sys_w") is not None:
-        put(row, 0, "Power", curses.color_pair(C_LABEL) | bold)
-        parts = []
-        if pi.get("gpu_w") is not None:
-            parts.append(f"GPU {pi['gpu_w']:.0f}W")
-        if pi.get("cpu_w") is not None:
-            parts.append(f"CPU {pi['cpu_w']:.0f}W")
-        note = "" if pi.get("cpu_w") is not None else "  (GPU only)"
-        put(row, 8, f"{'   '.join(parts)}    total {pi['sys_w']:.0f}W{note}")
+        section(row, "Power")
+        x = 10
+        for lbl, key in (("GPU", "gpu_w"), ("CPU", "cpu_w")):
+            if pi.get(key) is not None:
+                put(row, x, f"{lbl} ", curses.color_pair(C_DIM))
+                put(row, x + 4, f"{pi[key]:.0f}W", bold); x += 12
+        put(row, x, "total ", curses.color_pair(C_DIM))
+        put(row, x + 6, f"{pi['sys_w']:.0f}W", curses.color_pair(C_ACCENT) | bold)
+        if pi.get("cpu_w") is None:
+            put(row, x + 6 + len(f"{pi['sys_w']:.0f}W") + 2, "(GPU only)",
+                curses.color_pair(C_DIM))
         row += 2
 
     # ---- CPU / system ----
-    put(row, 0, "CPU / system", curses.color_pair(C_LABEL) | bold); row += 1
+    section(row, "CPU / system"); row += 1
     if not sensors:
         put(row, 2, "sensors unavailable", curses.color_pair(C_CRIT)); row += 1
     else:
-        col_w = 30
+        col_w = 34
         ncols = max(1, w // col_w)
         for i, (name, v) in enumerate(sensors):
             cy = row + i // ncols
             cx = 2 + (i % ncols) * col_w
-            thr = CPU_TEMP if name.startswith(("Tctl", "Tdie", "Tccd", "k10")) else GEN_TEMP
-            put(cy, cx, f"{name:<18}")
-            put(cy, cx + 18, f"{v:5.1f}C",
+            thr = (CPU_TEMP if name.startswith(("Tctl", "Tdie", "Tccd", "k10"))
+                   else GEN_TEMP)
+            put(cy, cx, f"{name:<18}", curses.color_pair(C_DIM))
+            put(cy, cx + 18, f"{v:4.0f}°",
                 curses.color_pair(color_for(v, thr)) | bold)
+            lo, hi = 30, thr[2] + 5
+            draw_meter(put, cy, cx + 24, (v - lo) / (hi - lo), 8,
+                       color_for(v, thr))
         row += (len(sensors) + ncols - 1) // ncols
     row += 1
 
     # ---- Peaks ----
-    put(row, 0, "Session peaks", curses.color_pair(C_LABEL) | bold)
-    put(row, 16, f"logging -> {os.path.relpath(logger.csv_path)}",
-        curses.color_pair(C_DIM))
+    section(row, "Session peaks",
+            f"logging → {os.path.relpath(logger.csv_path)}")
     row += 1
     items = list(peaks.items())
-    col_w = 26
+    col_w = 30
     ncols = max(1, w // col_w)
     for i, (name, (val, when)) in enumerate(items):
         cy = row + i // ncols
@@ -472,9 +578,10 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
             thr = GPU_TEMP
         else:
             thr = GEN_TEMP
-        show = f"{name:<13}{val:5.0f} @{when}"
-        attr = curses.color_pair(color_for(val, thr)) if is_temp else 0
-        put(cy, cx, show, attr)
+        put(cy, cx, f"{name:<13}", curses.color_pair(C_DIM))
+        attr = curses.color_pair(color_for(val, thr)) | bold if is_temp else bold
+        put(cy, cx + 13, f"{val:5.0f}", attr)
+        put(cy, cx + 19, f" @{when}", curses.color_pair(C_DIM))
 
     stdscr.refresh()
 
@@ -493,13 +600,51 @@ def fan_color(v):
     return C_OK
 
 
-def tempbar(v, thr, width=20):
+def clock_color(cur, mx):
+    """Colour a clock by how close it is to its max: bright when boosting,
+    dim when parked. Purely informational (a high clock is not a warning)."""
+    if cur is None:
+        return C_DIM
+    if mx is None or mx <= 0:
+        return C_LABEL
+    frac = cur / mx
+    if frac >= 0.7:
+        return C_OK
+    if frac >= 0.35:
+        return C_LABEL
+    return C_DIM
+
+
+# Eighth-width left blocks, for sub-cell bar resolution (1..7 eighths full).
+_FRAC_BLOCKS = "▏▎▍▌▋▊▉"
+
+
+def bar_parts(frac, width):
+    """Split a 0..1 fraction into (filled_str, track_str) of total `width`,
+    using partial block glyphs so the boundary cell is sub-character accurate."""
+    frac = max(0.0, min(1.0, frac))
+    eighths = int(round(frac * width * 8))
+    full, part = divmod(eighths, 8)
+    fill = "█" * full
+    if part and full < width:
+        fill += _FRAC_BLOCKS[part - 1]
+    return fill, "░" * (width - len(fill))
+
+
+def draw_meter(put, y, x, frac, width, color):
+    """Draw a filled bar: coloured fill over a muted track."""
+    fill, track = bar_parts(frac, width)
+    put(y, x, fill, curses.color_pair(color) | curses.A_BOLD)
+    put(y, x + len(fill), track, curses.color_pair(C_TRACK))
+
+
+def draw_tempbar(put, y, x, v, thr, width=12):
+    """Temperature meter, scaled 30..95C and coloured by threshold."""
     if v is None:
-        return ""
-    lo, hi = 30, 90
-    frac = max(0.0, min(1.0, (v - lo) / (hi - lo)))
-    n = int(frac * width)
-    return "[" + "#" * n + "-" * (width - n) + "]"
+        put(y, x, "░" * width, curses.color_pair(C_TRACK))
+        return
+    lo, hi = 30, 95
+    draw_meter(put, y, x, (v - lo) / (hi - lo), width, color_for(v, thr))
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +658,8 @@ def init_colors():
     curses.init_pair(C_HEAD, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(C_DIM, curses.COLOR_CYAN, -1)
     curses.init_pair(C_LABEL, curses.COLOR_WHITE, -1)
+    curses.init_pair(C_ACCENT, curses.COLOR_CYAN, -1)
+    curses.init_pair(C_TRACK, curses.COLOR_BLUE, -1)
 
 
 def run(stdscr, args):
@@ -523,7 +670,7 @@ def run(stdscr, args):
     start_str = time.strftime("%Y%m%d_%H%M%S")
     vram = None if args.no_vram else VramReader(args.gddr6_bin)
     power = PowerMeter()
-    logger = Logger(args.logdir, start_str, vram=vram is not None)
+    logger = Logger(args.logdir, start_str, vram=vram is not None, keep=args.keep)
     peaks = {}
     try:
         while True:
@@ -583,6 +730,10 @@ def main():
                     help="refresh seconds (default 2)")
     ap.add_argument("-d", "--logdir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
                     help="directory for CSV + peak logs (default ./logs)")
+    ap.add_argument("--keep", type=int, default=0, metavar="N",
+                    help="keep only the N most recent sessions in the log dir, "
+                         "deleting older CSV + peak files at startup "
+                         "(default 0 = keep all)")
     ap.add_argument("--gddr6-bin",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "gddr6", "build", "bin", "gddr6"),
@@ -591,6 +742,9 @@ def main():
     ap.add_argument("--no-vram", action="store_true",
                     help="disable GDDR6X VRAM temp reading (skips sudo gddr6)")
     args = ap.parse_args()
+    # curses needs the locale set for wide/Unicode glyphs (block bars, °) to
+    # render instead of turning into garbage.
+    locale.setlocale(locale.LC_ALL, "")
     try:
         curses.wrapper(run, args)
     except KeyboardInterrupt:

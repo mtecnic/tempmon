@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """tempmon - a simple TUI to watch GPU/CPU temps, fans, and load during inference.
 
-Refreshes every N seconds (default 2s) from nvidia-smi + lm-sensors, colour-codes
+Refreshes every N seconds (default 2s) from nvidia-smi + sysfs hwmon, colour-codes
 temperatures against throttle thresholds, and logs to disk every cycle so that if
 the box crashes you keep proof of how hot it got right before it went down.
+
+This branch is adapted for the DGX Spark (NVIDIA GB10, aarch64): CPU/SoC temps
+come straight from /sys/class/hwmon (no lm-sensors package needed), GPU memory
+falls back to /proc/meminfo because the GB10's 128 GB is unified (nvidia-smi
+reports memory.used/total as N/A), and the GDDR6X path is dormant -- there is
+no GDDR6X on this SoC, so a missing gddr6 binary silently disables VRAM temps
+instead of warning.
 
 Two log files are written and fsync'd every cycle (so they survive a hard crash):
   logs/tempmon_<start>.csv        full per-cycle timeline (wide CSV, one row/cycle)
@@ -15,7 +22,6 @@ Keys:  q / Ctrl-C = quit    p = reset peaks
 import argparse
 import curses
 import glob
-import json
 import locale
 import os
 import re
@@ -25,13 +31,14 @@ import threading
 import time
 
 # ---------------------------------------------------------------------------
-# Thresholds (deg C). (warn, hot, crit) -> colour steps. Tuned for RTX 3090 +
-# AMD (k10temp). GPUs throttle ~83C; EPYC/Threadripper Tctl runs hot by design.
+# Thresholds (deg C). (warn, hot, crit) -> colour steps. Tuned for the GB10
+# (Grace Blackwell SoC, throttles ~90C) and its ARM Cortex-X925/A725 clusters,
+# whose acpitz thermal zones idle ~40C in a small passively-assisted chassis.
 # ---------------------------------------------------------------------------
-GPU_TEMP = (60, 75, 84)
-CPU_TEMP = (70, 85, 95)
+GPU_TEMP = (70, 80, 88)
+CPU_TEMP = (70, 82, 92)
 GEN_TEMP = (55, 70, 82)   # nvme / misc
-VRAM_TEMP = (85, 95, 105)  # GDDR6X junction: throttles ~105C, hard limit ~110C
+VRAM_TEMP = (85, 95, 105)  # GDDR6X junction (dormant on GB10 -- unified LPDDR5X)
 
 # colour pair ids
 C_OK, C_WARN, C_HOT, C_CRIT, C_HEAD, C_DIM, C_LABEL = 1, 2, 3, 4, 5, 6, 7
@@ -85,6 +92,12 @@ def read_gpus():
             "sclk": num(f[10]), "mclk": num(f[11]),
             "sclk_max": num(f[12]), "mclk_max": num(f[13]),
         })
+    # Unified-memory boards (GB10): every GPU reports memory as N/A; fall back
+    # to system meminfo, which on a coherent CPU+GPU pool is the same memory.
+    if gpus and all(g["mem_total"] is None for g in gpus):
+        used, total = read_unified_mem()
+        for g in gpus:
+            g["mem_used"], g["mem_total"] = used, total
     return gpus
 
 
@@ -101,28 +114,56 @@ def pci_bus(bus_id):
 
 
 def read_sensors():
-    """Return list of (label, value_c) temps from lm-sensors. Empty on failure."""
-    try:
-        out = subprocess.run(["sensors", "-j"], capture_output=True,
-                             text=True, timeout=5, check=True).stdout
-        data = json.loads(out)
-    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
-        return []
+    """Return list of (label, value_c) temps from /sys/class/hwmon. Empty on failure.
+
+    Reads sysfs directly -- lm-sensors is not installed on the DGX Spark and
+    isn't needed: hwmon exposes the same data. Here that is acpitz (7 SoC/CPU
+    thermal zones, unlabeled -> acpitz:temp1..7), the NVMe drive, and the wifi
+    radio. A sensor whose value is momentarily unreadable (e.g. the mt7925
+    radio asleep reports an empty file) is skipped, never raised.
+    """
     temps = []
-    for chip, feats in data.items():
-        # short chip tag, e.g. k10temp-pci-00cb -> k10temp/cb, so multiple
-        # instances of the same chip (dual socket) stay distinguishable.
-        tag = chip.split("-")[0]
-        suffix = chip.split("-")[-1][-2:] if "-" in chip else ""
-        label = f"{tag}/{suffix}" if suffix else tag
-        for feat, sub in feats.items():
-            if not isinstance(sub, dict):
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(h, "name")) as f:
+                chip = f.read().strip()
+        except OSError:
+            continue
+        for inp in sorted(glob.glob(os.path.join(h, "temp*_input"))):
+            stem = inp[:-len("_input")]
+            label = os.path.basename(stem)
+            try:
+                with open(stem + "_label") as f:
+                    label = f.read().strip() or label
+            except OSError:
+                pass
+            try:
+                with open(inp) as f:
+                    v = int(f.read().strip()) / 1000.0
+            except (OSError, ValueError):
                 continue
-            for k, v in sub.items():
-                if k.endswith("_input") and isinstance(v, (int, float)):
-                    temps.append((f"{label}:{feat}", float(v)))
-                    break
+            temps.append((f"{chip}:{label}", v))
     return temps
+
+
+def read_unified_mem():
+    """(used_mib, total_mib) from /proc/meminfo, or (None, None) on failure.
+
+    The GB10's 128 GB is one coherent pool shared by CPU and GPU -- nvidia-smi
+    reports memory.used/total as N/A, and system meminfo IS the GPU memory.
+    Used is MemTotal - MemAvailable (what a new allocation could not get).
+    """
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                info[key] = int(rest.split()[0])  # kB
+        total = info["MemTotal"] / 1024.0
+        used = (info["MemTotal"] - info["MemAvailable"]) / 1024.0
+        return used, total
+    except (OSError, ValueError, KeyError, IndexError):
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +558,8 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
             pw = "-"
             if g["power"] is not None and g["power_lim"] is not None:
                 pw = f"{g['power']:.0f}/{g['power_lim']:.0f}W"
+            elif g["power"] is not None:  # GB10 reports no power.limit
+                pw = f"{g['power']:.0f}W"
             pcol = C_OK
             if g["power"] is not None and g["power_lim"]:
                 pcol = fan_color(100 * g["power"] / g["power_lim"])
@@ -550,7 +593,8 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
         for i, (name, v) in enumerate(sensors):
             cy = row + i // ncols
             cx = 2 + (i % ncols) * col_w
-            thr = (CPU_TEMP if name.startswith(("Tctl", "Tdie", "Tccd", "k10"))
+            thr = (CPU_TEMP
+                   if name.startswith(("Tctl", "Tdie", "Tccd", "k10", "acpitz"))
                    else GEN_TEMP)
             put(cy, cx, f"{name:<18}", curses.color_pair(C_DIM))
             put(cy, cx + 18, f"{v:4.0f}°",
@@ -668,7 +712,12 @@ def run(stdscr, args):
     stdscr.nodelay(True)
     start = time.time()
     start_str = time.strftime("%Y%m%d_%H%M%S")
-    vram = None if args.no_vram else VramReader(args.gddr6_bin)
+    # No gddr6 binary means no GDDR6X to read (true by construction on the
+    # GB10 -- unified LPDDR5X): stay silent and skip the VRAM columns entirely
+    # rather than warning about a tool that cannot apply to this hardware.
+    vram = None
+    if not args.no_vram and os.path.exists(args.gddr6_bin):
+        vram = VramReader(args.gddr6_bin)
     power = PowerMeter()
     logger = Logger(args.logdir, start_str, vram=vram is not None, keep=args.keep)
     peaks = {}

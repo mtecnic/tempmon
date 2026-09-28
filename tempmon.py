@@ -100,15 +100,31 @@ def pci_bus(bus_id):
         return None
 
 
+# lm-sensors names every reading <feature><n>_input regardless of unit, so
+# fan RPM (fan1_input), volts (in0_input), watts and amps all look alike; only
+# temp*_input is degrees C. Unconnected thermistors report sentinels well
+# outside any real range (-55, -128 here), so those are dropped too.
+TEMP_INPUT = re.compile(r"temp\d+_input")
+FAN_INPUT = re.compile(r"fan\d+_input")
+TEMP_SANE = (-40.0, 200.0)
+
+
 def read_sensors():
-    """Return list of (label, value_c) temps from lm-sensors. Empty on failure."""
+    """Return (temps, fans) from one `sensors -j` call: [(label, degrees_c)]
+    and [(label, rpm)]. ([], []) on any failure.
+
+    Both lists cover every channel the chips expose, in a stable order, so the
+    frozen CSV header keeps matching row-by-row -- including fan headers that
+    sit at 0 RPM (unpopulated, or a fan that died mid-session). `draw()` is
+    what hides the idle ones; the log keeps the full record.
+    """
     try:
         out = subprocess.run(["sensors", "-j"], capture_output=True,
                              text=True, timeout=5, check=True).stdout
         data = json.loads(out)
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
-        return []
-    temps = []
+        return [], []
+    temps, fans = [], []
     for chip, feats in data.items():
         # short chip tag, e.g. k10temp-pci-00cb -> k10temp/cb, so multiple
         # instances of the same chip (dual socket) stay distinguishable.
@@ -119,10 +135,16 @@ def read_sensors():
             if not isinstance(sub, dict):
                 continue
             for k, v in sub.items():
-                if k.endswith("_input") and isinstance(v, (int, float)):
-                    temps.append((f"{label}:{feat}", float(v)))
+                if not isinstance(v, (int, float)):
+                    continue
+                if TEMP_INPUT.fullmatch(k):
+                    if TEMP_SANE[0] <= float(v) <= TEMP_SANE[1]:
+                        temps.append((f"{label}:{feat}", float(v)))
                     break
-    return temps
+                if FAN_INPUT.fullmatch(k):
+                    fans.append((f"{label}:{feat}", float(v)))
+                    break
+    return temps, fans
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +339,7 @@ class Logger:
         # Rotate old sessions now that this run's files exist and are newest.
         self.pruned = prune_logs(logdir, keep) if keep and keep > 0 else 0
 
-    def _columns(self, gpus, sensors):
+    def _columns(self, gpus, sensors, fans):
         cols = ["timestamp"]
         for g in gpus:
             i = g["idx"]
@@ -328,12 +350,14 @@ class Logger:
                 cols.append(f"gpu{i}_vram_temp")
         for name, _ in sensors:
             cols.append("cpu_" + name.replace(" ", "_"))
+        for name, _ in fans:
+            cols.append("fan_" + name.replace(" ", "_") + "_rpm")
         cols += ["gpu_power_total_w", "cpu_package_w", "system_power_w"]
         return cols
 
-    def write_cycle(self, ts_str, gpus, sensors, power_info=None):
+    def write_cycle(self, ts_str, gpus, sensors, fans, power_info=None):
         if self.header is None:
-            self.header = self._columns(gpus, sensors)
+            self.header = self._columns(gpus, sensors, fans)
             self.csv.write(",".join(self.header) + "\n")
         row = [ts_str]
         for g in gpus:
@@ -344,6 +368,8 @@ class Logger:
                 row.append(fmt(g.get("vram")))
         for _, v in sensors:
             row.append(fmt(v))
+        for _, rpm in fans:
+            row.append(fmt(rpm))
         pi = power_info or {}
         row += [fmt(pi.get("gpu_w")), fmt(pi.get("cpu_w")), fmt(pi.get("sys_w"))]
         self.csv.write(",".join(row) + "\n")
@@ -403,7 +429,7 @@ def fmt(v):
 # ---------------------------------------------------------------------------
 # Peak tracking
 # ---------------------------------------------------------------------------
-def update_peaks(peaks, gpus, sensors, power_info=None):
+def update_peaks(peaks, gpus, sensors, fans, power_info=None):
     now = time.strftime("%H:%M:%S")
     def bump(name, val):
         if val is None:
@@ -417,6 +443,11 @@ def update_peaks(peaks, gpus, sensors, power_info=None):
         bump(f"GPU{g['idx']} power", g["power"])
     for name, v in sensors:
         bump(name, v)
+    for name, rpm in fans:
+        # 0 RPM never seeds a peak, so unpopulated headers stay out of the
+        # panel entirely, while a fan that spun and then stopped keeps its
+        # peak on record -- which is the case worth seeing after a crash.
+        bump(f"{name} rpm", rpm or None)
     if power_info:
         bump("system power", power_info.get("sys_w"))
 
@@ -440,8 +471,8 @@ GPU_COLS = {
 }
 
 
-def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
-         vram_status="", power_info=None):
+def draw(stdscr, gpus, sensors, fans, peaks, interval, logger, start_str,
+         uptime, vram_status="", power_info=None):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -561,12 +592,36 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
         row += (len(sensors) + ncols - 1) // ncols
     row += 1
 
+    # ---- Fans ----
+    # Only channels actually turning are listed: an unpopulated header and a
+    # stopped fan both read 0 RPM and there is no way to tell them apart from
+    # a sample, so parking them in a trailing "N idle" count keeps the row
+    # short without dropping them from the CSV.
+    spinning = [(n, r) for n, r in fans if r]
+    idle = len(fans) - len(spinning)
+    if fans:
+        note = f"{idle} idle" if idle else ""
+        section(row, "Fans", note); row += 1
+        if not spinning:
+            put(row, 2, "no fans reporting RPM", curses.color_pair(C_WARN))
+            row += 1
+        else:
+            col_w = 26
+            ncols = max(1, w // col_w)
+            for i, (name, rpm) in enumerate(spinning):
+                cy = row + i // ncols
+                cx = 2 + (i % ncols) * col_w
+                put(cy, cx, f"{name:<18}", curses.color_pair(C_DIM))
+                put(cy, cx + 18, f"{rpm:5.0f}", curses.color_pair(C_OK) | bold)
+            row += (len(spinning) + ncols - 1) // ncols
+        row += 1
+
     # ---- Peaks ----
     section(row, "Session peaks",
             f"logging → {os.path.relpath(logger.csv_path)}")
     row += 1
     items = list(peaks.items())
-    col_w = 30
+    col_w = 34
     ncols = max(1, w // col_w)
     for i, (name, (val, when)) in enumerate(items):
         cy = row + i // ncols
@@ -578,10 +633,10 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
             thr = GPU_TEMP
         else:
             thr = GEN_TEMP
-        put(cy, cx, f"{name:<13}", curses.color_pair(C_DIM))
+        put(cy, cx, f"{name:<18}", curses.color_pair(C_DIM))
         attr = curses.color_pair(color_for(val, thr)) | bold if is_temp else bold
-        put(cy, cx + 13, f"{val:5.0f}", attr)
-        put(cy, cx + 19, f" @{when}", curses.color_pair(C_DIM))
+        put(cy, cx + 18, f"{val:5.0f}", attr)
+        put(cy, cx + 24, f" @{when}", curses.color_pair(C_DIM))
 
     stdscr.refresh()
 
@@ -682,18 +737,18 @@ def run(stdscr, args):
                                else "vram: gddr6 unavailable")
             else:
                 vram_status = ""
-            sensors = read_sensors()
+            sensors, fans = read_sensors()
             gpu_w = gpu_power_total(gpus)
             cpu_w = power.watts()
             sys_w = None if gpu_w is None and cpu_w is None else \
                 (gpu_w or 0) + (cpu_w or 0)
             power_info = {"gpu_w": gpu_w, "cpu_w": cpu_w, "sys_w": sys_w}
-            update_peaks(peaks, gpus, sensors, power_info)
+            update_peaks(peaks, gpus, sensors, fans, power_info)
             uptime = fmt_dur(time.time() - start)
             logger.write_cycle(time.strftime("%Y-%m-%d %H:%M:%S"), gpus, sensors,
-                               power_info)
+                               fans, power_info)
             logger.write_peaks(peaks, start_str, uptime)
-            draw(stdscr, gpus, sensors, peaks, args.interval, logger,
+            draw(stdscr, gpus, sensors, fans, peaks, args.interval, logger,
                  start_str, uptime, vram_status, power_info)
             # wait for interval, but stay responsive to keys
             deadline = time.time() + args.interval

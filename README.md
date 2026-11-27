@@ -46,6 +46,13 @@ Core temp, **GDDR6X VRAM junction temp**, fan %, utilisation, graphics and memor
 temps from `lm-sensors`, NVMe temps, a system power line, and a session peak table with the
 timestamp of each peak.
 
+The **CPU** and **Memory** sections are read straight from `/proc` and `/sys`. They need no
+root and start no subprocesses. CPU shows model, topology, governor, overall utilisation
+(user/sys/iowait), average and max clock, load average, a per-thread sparkline and the top 3
+processes by CPU. Memory shows RAM used/available, reclaimable cache, shmem (`/dev/shm`, where
+vLLM keeps a lot), dirty pages, swap, PSI stall percentages for cpu/mem/io, and the top 3
+processes by RSS. On a narrow terminal each line drops its least important items first.
+
 Colour thresholds are tuned per metric, with VRAM on its own scale
 (`85 / 95 / 105 °C`) because 96 °C is unremarkable for a core and alarming for GDDR6X.
 
@@ -79,7 +86,7 @@ Two files per session, named by start timestamp, both in the log directory:
 
 | File | What's in it |
 |---|---|
-| `tempmon_<start>.csv` | One wide row per cycle — every GPU and sensor value, full timeline. The header is locked in on the first cycle from whatever hardware was present. |
+| `tempmon_<start>.csv` | One wide row per cycle — every GPU and sensor value, then power, then CPU/RAM/swap/PSI stats, full timeline. The header is locked in on the first cycle from whatever hardware was present. |
 | `tempmon_<start>_peak.txt` | Running peak of every metric with the time it happened. Rewritten each cycle. |
 
 Both are `flush()` + `fsync()`ed every cycle. `--keep N` prunes all but the N most recent

@@ -55,8 +55,20 @@ struct device dev_table[] =
     { .offset = 0x0000E2A8, .dev_id = 0x26b9, .vram = "GDDR6",  .arch = "AD102", .name =  "L40S" },
     { .offset = 0x0000E2A8, .dev_id = 0x2236, .vram = "GDDR6",  .arch = "GA102", .name =  "A10" },
     /* Blackwell GDDR7: per-module FBPA DRAM sensors, reverse-engineered by
-     * olealgoritme/gpuwatch (MIT). See gddr7_hottest_module() below. */
+     * olealgoritme/gpuwatch (MIT). See gddr7_hottest_module() below.
+     * Only 0x2B85 is tested; the rest share the GB202 die (IDs from pci.ids)
+     * and are assumed to share its FBPA register layout. */
     { .offset = 0x009024C0, .dev_id = 0x2B85, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX 5090", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2B87, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX 5090 D", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2B8C, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX 5090 D V2", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB1, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 6000 Blackwell", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB2, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 6000D Blackwell", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB3, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 5000 Blackwell", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB4, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 6000 Blackwell Max-Q", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB5, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 6000 Blackwell Server", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BB9, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX 6000D", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BBC, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 6000D Blackwell Max-Q", .kind = VRAM_GDDR7 },
+    { .offset = 0x009024C0, .dev_id = 0x2BBD, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX PRO 5500 Blackwell", .kind = VRAM_GDDR7 },
 };
 
 void gddr6_init(void)

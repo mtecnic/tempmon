@@ -32,6 +32,30 @@ GPU_TEMP = (60, 75, 84)
 CPU_TEMP = (70, 85, 95)
 GEN_TEMP = (55, 70, 82)   # nvme / misc
 VRAM_TEMP = (85, 95, 105)  # GDDR6X junction: throttles ~105C, hard limit ~110C
+# Shutdown-margin (°C, lower = hotter) colouring for the T.Limit proxy column.
+TLIMIT_WARN = 10
+TLIMIT_HOT = 5
+
+
+def vram_kind(name):
+    """Memory generation for a GPU model name: 'GDDR7' / 'GDDR6X' / 'GDDR6' /
+    'HBM' / None when the name says nothing. VRAM junction temps are only
+    readable on the GDDR6/6X cards gddr6 supports; GDDR7 (Blackwell) and HBM
+    expose nothing, and saying so beats showing a misleading 'unavailable'.
+    First match wins, so specific patterns sit above the generic ones."""
+    if not name:
+        return None
+    if re.search(r"Blackwell|\bRTX PRO \d{3,4}\b", name):
+        return "GDDR7"
+    if re.search(r"H100|H200|H800|\bB100\b|\bB200\b|GB20", name):
+        return "HBM"
+    # RTX 40-series, excluding the GDDR6 4060-family (not gddr6-supported).
+    if re.search(r"\b40[7-9]0\b|\b4090\b", name):
+        return "GDDR6X"
+    # Ampere: 3090/3080(-Ti) GDDR6X, 3070/A-series GDDR6 -- either way readable.
+    if re.search(r"\b30[7-9]0\b", name) or re.search(r"\bA[1-6]\d{3}\b|\bA10\b|\bL40S?\b", name):
+        return "GDDR6"
+    return None
 
 # Non-temperature thresholds, same (warn, hot, crit) shape.
 CPU_UTIL = (50, 80, 95)    # % busy across all threads (and per thread)
@@ -59,7 +83,9 @@ def color_for(val, thr):
 # ---------------------------------------------------------------------------
 GPU_QUERY = ("index,name,temperature.gpu,fan.speed,utilization.gpu,"
              "memory.used,memory.total,power.draw,power.limit,pci.bus_id,"
-             "clocks.gr,clocks.mem,clocks.max.gr,clocks.max.mem")
+             "clocks.gr,clocks.mem,clocks.max.gr,clocks.max.mem,"
+             "temperature.gpu.tlimit")
+GPU_QUERY_FIELDS = 15
 
 
 def read_gpus():
@@ -74,7 +100,7 @@ def read_gpus():
     gpus = []
     for line in out.strip().splitlines():
         f = [x.strip() for x in line.split(",")]
-        if len(f) < 14:
+        if len(f) < GPU_QUERY_FIELDS:
             continue
         def num(x):
             try:
@@ -89,6 +115,12 @@ def read_gpus():
             "bus": pci_bus(f[9]), "vram": None,
             "sclk": num(f[10]), "mclk": num(f[11]),
             "sclk_max": num(f[12]), "mclk_max": num(f[13]),
+            # Distance (°C) from the core's shutdown threshold. On Blackwell
+            # this is the closest readable proxy for board-wide thermal margin,
+            # since memory temp is not exposed there. [N/A] -> None elsewhere.
+            # On GeForce (CUDA 12.4+) it reports the negative headroom below the
+            # thermal slowdown point -- same meaning either way: lower = hotter.
+            "tlimit": num(f[14]),
         })
     return gpus
 
@@ -569,7 +601,8 @@ class Logger:
             i = g["idx"]
             cols += [f"gpu{i}_temp", f"gpu{i}_fan", f"gpu{i}_util",
                      f"gpu{i}_mem_used_mb", f"gpu{i}_power_w",
-                     f"gpu{i}_core_clock_mhz", f"gpu{i}_mem_clock_mhz"]
+                     f"gpu{i}_core_clock_mhz", f"gpu{i}_mem_clock_mhz",
+                     f"gpu{i}_tlimit_c"]
             if self.vram:
                 cols.append(f"gpu{i}_vram_temp")
         for name, _ in sensors:
@@ -586,7 +619,7 @@ class Logger:
         for g in gpus:
             row += [fmt(g["temp"]), fmt(g["fan"]), fmt(g["util"]),
                     fmt(g["mem_used"]), fmt(g["power"]),
-                    fmt(g["sclk"]), fmt(g["mclk"])]
+                    fmt(g["sclk"]), fmt(g["mclk"]), fmt(g.get("tlimit"))]
             if self.vram:
                 row.append(fmt(g.get("vram")))
         for _, v in sensors:
@@ -662,6 +695,7 @@ def update_peaks(peaks, gpus, sensors, power_info=None, sysstats=None):
     for g in gpus:
         bump(f"GPU{g['idx']} temp", g["temp"])
         bump(f"GPU{g['idx']} vram", g.get("vram"))
+        bump(f"GPU{g['idx']} tlimit", g.get("tlimit"))
         bump(f"GPU{g['idx']} fan%", g["fan"])
         bump(f"GPU{g['idx']} power", g["power"])
     for name, v in sensors:
@@ -687,13 +721,24 @@ GPU_COLS = {
     "core": (4, 4),
     "bar":  (9, 12),
     "vram": (22, 5),
-    "fan":  (28, 5),
-    "util": (34, 5),
-    "sclk": (40, 6),
-    "mclk": (47, 6),
-    "mem":  (54, 12),
-    "pwr":  (67, 11),
+    "margin": (28, 6),
+    "fan":  (35, 5),
+    "util": (41, 5),
+    "sclk": (47, 6),
+    "mclk": (54, 6),
+    "mem":  (61, 12),
+    "pwr":  (74, 11),
 }
+
+
+def tlimit_color(margin):
+    """Colour a shutdown-margin (°C): wide is fine, narrow is not. Inverting
+    the value maps 'lower = hotter' onto color_for's rising thresholds."""
+    if margin is None:
+        return C_DIM
+    if margin <= 0:
+        return C_CRIT
+    return color_for(-margin, (-TLIMIT_WARN, -TLIMIT_HOT, -1))
 
 
 def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
@@ -742,14 +787,20 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
     rule(row); row += 1
 
     # ---- GPUs ----
-    section(row, "GPUs", vram_status,
-            C_OK if "unavailable" not in vram_status else C_WARN)
+    if vram_status.startswith("vram: n/a"):
+        vcol = C_DIM          # honest absence (GDDR7/HBM), not a fault
+    elif vram_status and "unavailable" not in vram_status:
+        vcol = C_OK
+    else:
+        vcol = C_WARN if vram_status else C_DIM
+    section(row, "GPUs", vram_status, vcol)
     row += 1
     if not gpus:
         put(row, 2, "nvidia-smi unavailable", curses.color_pair(C_CRIT)); row += 1
     else:
         hcol = curses.color_pair(C_DIM)
         for key, label in (("idx", "#"), ("core", "core"), ("vram", "vram"),
+                           ("margin", "t-margin"),
                            ("fan", "fan"), ("util", "util"), ("sclk", "sclk"),
                            ("mclk", "mclk"), ("mem", "memory"), ("pwr", "power")):
             cell(row, key, label, hcol)
@@ -766,6 +817,12 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
             vcol = (curses.color_pair(color_for(vram, VRAM_TEMP)) | bold
                     if vram is not None else curses.color_pair(C_DIM))
             cell(row, "vram", ival(vram) + "°", vcol)
+            # Thermal headroom to the core's shutdown threshold: the VRAM-side
+            # proxy on cards whose memory temp is unreadable (GDDR7), and a
+            # useful absolute-scale check everywhere else.
+            tl = g.get("tlimit")
+            cell(row, "margin", (ival(tl) + "°C") if tl is not None else "-",
+                 curses.color_pair(tlimit_color(tl)))
             cell(row, "fan", ival(g["fan"]) + "%",
                  curses.color_pair(fan_color(g["fan"])))
             cell(row, "util", ival(g["util"]) + "%",
@@ -838,7 +895,7 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
     for i, (name, (val, when)) in enumerate(items):
         cy = row + i // ncols
         cx = 2 + (i % ncols) * col_w
-        is_temp = "temp" in name or "vram" in name
+        is_temp = "temp" in name or "vram" in name or "tlimit" in name
         if "vram" in name:
             thr = VRAM_TEMP
         elif "temp" in name:
@@ -846,7 +903,12 @@ def draw(stdscr, gpus, sensors, peaks, interval, logger, start_str, uptime,
         else:
             thr = GEN_TEMP
         put(cy, cx, f"{name:<13}", curses.color_pair(C_DIM))
-        attr = curses.color_pair(color_for(val, thr)) | bold if is_temp else bold
+        if "tlimit" in name:
+            # min-margin peak: bump() tracked max, so a rising peak is fine here
+            attr = curses.color_pair(tlimit_color(val)) | bold
+        else:
+            attr = (curses.color_pair(color_for(val, thr)) | bold
+                    if is_temp else bold)
         put(cy, cx + 13, f"{val:5.0f}", attr)
         put(cy, cx + 19, f" @{when}", curses.color_pair(C_DIM))
 
@@ -1093,8 +1155,15 @@ def run(stdscr, args):
             if vram is not None:
                 for g in gpus:
                     g["vram"] = vram.get(g["bus"])
-                vram_status = ("vram via gddr6" if vram.available
-                               else "vram: gddr6 unavailable")
+                kinds = {vram_kind(g["name"]) for g in gpus} - {None}
+                if vram.available:
+                    vram_status = "vram via gddr6"
+                elif kinds and kinds <= {"GDDR7", "HBM"}:
+                    # Nothing to be unavailable about: no reader exists for
+                    # this memory. t-margin is the thermal proxy shown instead.
+                    vram_status = f"vram: n/a ({'/'.join(sorted(kinds))})"
+                else:
+                    vram_status = "vram: gddr6 unavailable"
             else:
                 vram_status = ""
             sensors = read_sensors()

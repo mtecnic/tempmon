@@ -22,6 +22,11 @@
 
 #define MAX_DEVICES 32
 
+/* GDDR7 per-module layout (GB202), from olealgoritme/gpuwatch */
+#define GDDR7_MODULE_STRIDE 0x4000
+#define GDDR7_VALID_OFF     0x10
+#define GDDR7_MAX_MODULES   16
+
 struct gddr6_ctx ctx = {0};
 struct device dev_table[] =
 {
@@ -49,6 +54,9 @@ struct device dev_table[] =
     { .offset = 0x0000E2A8, .dev_id = 0x27b8, .vram = "GDDR6",  .arch = "AD104", .name =  "L4" },
     { .offset = 0x0000E2A8, .dev_id = 0x26b9, .vram = "GDDR6",  .arch = "AD102", .name =  "L40S" },
     { .offset = 0x0000E2A8, .dev_id = 0x2236, .vram = "GDDR6",  .arch = "GA102", .name =  "A10" },
+    /* Blackwell GDDR7: per-module FBPA DRAM sensors, reverse-engineered by
+     * olealgoritme/gpuwatch (MIT). See gddr7_hottest_module() below. */
+    { .offset = 0x009024C0, .dev_id = 0x2B85, .vram = "GDDR7",  .arch = "GB202", .name =  "RTX 5090", .kind = VRAM_GDDR7 },
 };
 
 void gddr6_init(void)
@@ -111,7 +119,16 @@ void gddr6_memory_map(void)
         ctx.devices[i].phys_addr = (ctx.devices[i].bar0 + ctx.devices[i].offset);
         ctx.devices[i].base_offset = ctx.devices[i].phys_addr & ~(PG_SZ - 1);
 
-        ctx.devices[i].mapped_addr = mmap(0, PG_SZ, PROT_READ, MAP_SHARED, ctx.fd, ctx.devices[i].base_offset);
+        size_t len = PG_SZ;
+        if (ctx.devices[i].kind == VRAM_GDDR7)
+        {
+            size_t span = (ctx.devices[i].phys_addr - ctx.devices[i].base_offset)
+                        + (GDDR7_MAX_MODULES - 1) * GDDR7_MODULE_STRIDE + GDDR7_VALID_OFF + sizeof(uint32_t);
+            len = (span + PG_SZ - 1) & ~(PG_SZ - 1);
+        }
+        ctx.devices[i].map_len = len;
+
+        ctx.devices[i].mapped_addr = mmap(0, len, PROT_READ, MAP_SHARED, ctx.fd, ctx.devices[i].base_offset);
         if (ctx.devices[i].mapped_addr == MAP_FAILED)
         {
             ctx.devices[i].mapped_addr = NULL;
@@ -123,6 +140,31 @@ void gddr6_memory_map(void)
             ctx.devices[i].arch, ctx.devices[i].dev_id, ctx.devices[i].bus, ctx.devices[i].dev, ctx.devices[i].func);
         }
     }
+}
+
+/* Hottest valid GDDR7 module in degrees C, or INT32_MIN if none read valid.
+ * Bits 23:16 of each FBPA DQR register hold a GDDR mode-register temperature
+ * code; a module is present when bits 27:24 of the register at +0x10 are all
+ * set, and 0xBADFxxxx is the GPU's "no such register" poison value. */
+static int gddr7_hottest_module(const volatile uint8_t *base)
+{
+    int hottest = INT32_MIN;
+    for (int p = 0; p < GDDR7_MAX_MODULES; p++)
+    {
+        const volatile uint8_t *m = base + (size_t)p * GDDR7_MODULE_STRIDE;
+        uint32_t vld = *(const volatile uint32_t *)(m + GDDR7_VALID_OFF);
+        if (((vld >> 24) & 0xFu) != 0xFu)
+            continue;
+        uint32_t dq = *(const volatile uint32_t *)m;
+        if ((dq & 0xFFFF0000u) == 0xBADF0000u)
+            continue;
+        int code = (int)((dq >> 16) & 0xFFu);
+        if (code > 80) code = 80;
+        int c = (code > 19) ? (code - 20) * 2 : -(40 - code * 2);
+        if (c > -40 && c < 130 && c > hottest)
+            hottest = c;
+    }
+    return hottest;
 }
 
 void gddr6_monitor_temperatures(void)
@@ -137,6 +179,15 @@ void gddr6_monitor_temperatures(void)
             }
 
             void *virt_addr = (uint8_t *) ctx.devices[i].mapped_addr + (ctx.devices[i].phys_addr  - ctx.devices[i].base_offset);
+            if (ctx.devices[i].kind == VRAM_GDDR7)
+            {
+                int t = gddr7_hottest_module((const volatile uint8_t *)virt_addr);
+                if (t == INT32_MIN)
+                    printf("  n/a |");   /* keep the cell so columns stay aligned */
+                else
+                    printf(" %3d°C |", t);
+                continue;
+            }
             uint32_t read_result = *((uint32_t *)virt_addr);
             uint32_t temp = ((read_result & 0x00000fff) / 0x20);
 
@@ -153,7 +204,7 @@ void gddr6_cleanup(int signal)
     {
         if (ctx.devices[i].mapped_addr != NULL && ctx.devices[i].mapped_addr != MAP_FAILED)
         {
-            munmap(ctx.devices[i].mapped_addr, PG_SZ);
+            munmap(ctx.devices[i].mapped_addr, ctx.devices[i].map_len ? ctx.devices[i].map_len : (size_t)PG_SZ);
             ctx.devices[i].mapped_addr = NULL;
         }
     }

@@ -3,6 +3,7 @@
 #define GDDR6_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 struct device
 {
@@ -16,7 +17,11 @@ struct device
     void *mapped_addr;
     uint32_t phys_addr;
     uint32_t base_offset;
+    int kind;          /* VRAM_GDDR6 (single register) or VRAM_GDDR7 (per-module FBPA) */
+    size_t map_len;    /* bytes mapped at base_offset */
 };
+
+enum { VRAM_GDDR6 = 0, VRAM_GDDR7 = 1 };
 
 struct gddr6_ctx {
   struct device *devices;

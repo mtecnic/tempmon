@@ -437,7 +437,7 @@ def gpu_power_total(gpus):
 # GDDR6X VRAM temps (via olealgoritme/gddr6, which needs root)
 # ---------------------------------------------------------------------------
 class VramReader:
-    """Latest GDDR6/GDDR6X VRAM junction temps, keyed by PCI bus number.
+    """Latest GDDR6/GDDR6X/GDDR7 VRAM temps, keyed by PCI bus number.
 
     nvidia-smi can't read VRAM temp on GeForce cards, so we lean on the `gddr6`
     binary (mmaps the GPU BAR; requires root). It has no one-shot mode -- it
@@ -459,7 +459,7 @@ class VramReader:
     """
 
     _DEV_RE = re.compile(rb"pci=([0-9a-fA-F]+):")
-    _TEMP_RE = re.compile(rb"(\d+)\xc2\xb0C")  # NN°C, degree sign is UTF-8 c2 b0
+    _TEMP_RE = re.compile(rb"(-?\d+)\xc2\xb0C")  # NN°C, degree sign is UTF-8 c2 b0
 
     def __init__(self, bin_path):
         self.bus_order = []   # PCI bus ints, in gddr6's device order
@@ -494,10 +494,20 @@ class VramReader:
                         if m:
                             self.bus_order.append(int(m.group(1), 16))
                     elif b"VRAM Temps:" in line:
-                        vals = self._TEMP_RE.findall(line)
-                        for i, v in enumerate(vals):
-                            if i < len(self.bus_order):
-                                self.temps[self.bus_order[i]] = float(v)
+                        # One "|"-delimited cell per card, in device order. A
+                        # cell without a temp (" n/a ", e.g. no valid GDDR7
+                        # module read) clears that card instead of shifting
+                        # later cards' readings onto the wrong bus.
+                        cells = line.split(b"|")[1:-1]
+                        for i, cell in enumerate(cells):
+                            if i >= len(self.bus_order):
+                                break
+                            m = self._TEMP_RE.search(cell)
+                            bus = self.bus_order[i]
+                            if m:
+                                self.temps[bus] = float(m.group(1))
+                            else:
+                                self.temps.pop(bus, None)
         except (OSError, ValueError):
             pass
         finally:

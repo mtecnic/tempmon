@@ -24,6 +24,12 @@ third-party code described below.
   [upstream](https://github.com/olealgoritme/gddr6) directly, or run `tempmon --no-vram`
   and skip it entirely.
 
+  **Local modification:** RTX 5090 (GB202, GDDR7) support was added to `gddr6/lib/src/gddr6.c`
+  and `gddr6/lib/include/gddr6.h`. The register offsets (`0x009024C0` + `0x4000` per module,
+  valid bits at `+0x10`) and the mode-register temperature decode come from
+  [olealgoritme/gpuwatch](https://github.com/olealgoritme/gpuwatch) (MIT, same author). Like
+  that project, they are reverse-engineered and not documented by NVIDIA.
+
   Upstream's own README additionally documents the `iomem=relaxed` kernel parameter and
   Secure Boot requirements, and is the authoritative source for its supported-GPU list.
 
